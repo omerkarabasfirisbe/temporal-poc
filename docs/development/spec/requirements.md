@@ -17,6 +17,13 @@
 - No duplicate executions across multiple pods
 - No external lock table required
 
+**FR-1.2.1:** Overlapping execution policy must be configurable.
+- Options: SKIP, PARALLEL, CANCEL_PREVIOUS
+- SKIP: If previous run is still executing, skip current trigger
+- PARALLEL: Allow concurrent executions (use with caution)
+- CANCEL_PREVIOUS: Terminate previous run and start new one
+- Default: SKIP (safer)
+
 **FR-1.3:** The library must support manual job triggering.
 - Jobs can be triggered on-demand via API
 - Manual runs should not interfere with scheduled runs
@@ -26,6 +33,7 @@
 **FR-2.1:** The library must execute jobs for all active tenants.
 - Automatically iterate through tenant list
 - Each tenant processed in isolation
+- Tenant list fetched via TenantProvider interface (see A-4)
 
 **FR-2.2:** The library must propagate tenant context to business logic.
 - Integration with existing `PfContextHolder`
@@ -35,6 +43,13 @@
 **FR-2.3:** Tenant failures must be isolated.
 - Failure in Tenant A must not affect Tenant B
 - Failed tenants should be retried independently
+- Note: This refers to Activity-level retries managed by Temporal, not application-level restart strategies. System-wide failures (e.g., Worker crash) are handled by Kubernetes restart policies.
+
+**FR-2.4:** The library should support tenant-specific configuration overrides.
+- Retry policies per tenant
+- Timeout settings per tenant
+- Enabled/disabled jobs per tenant
+- Default: Global settings apply to all tenants
 
 ### FR-3: Retry and Error Handling
 
@@ -51,6 +66,12 @@
 **FR-3.3:** The library must report failures after retry exhaustion.
 - Integration with existing alerting system
 - Detailed error information in logs
+
+**FR-3.4:** The library must provide a mechanism to classify exceptions.
+- Default classifications for common exceptions (e.g., IOException: retryable, NullPointerException: non-retryable)
+- Custom classification via annotation or configuration
+- Example: `@NonRetryable(BusinessValidationException.class)`
+- Exception hierarchy respected (parent class rules apply to subclasses)
 
 ### FR-4: Visibility and Monitoring
 
@@ -87,6 +108,13 @@
 - Connection retry with backoff
 - Clear error reporting
 
+**NFR-2.3:** The library must support graceful shutdown.
+- Respect Kubernetes SIGTERM signals
+- Complete in-progress activities before shutdown
+- Do not start new activities after shutdown signal
+- Configurable shutdown timeout (default: 30s)
+- Hand off remaining work to other workers
+
 ### NFR-3: Developer Experience
 
 **NFR-3.1:** Minimal boilerplate for job definition.
@@ -104,9 +132,12 @@
 - Default retry policies
 - Parallelism settings
 
-**NFR-4.2:** The library must be deployable without Temporal for local development.
-- Mock mode for unit testing
-- In-memory execution option
+**NFR-4.2:** Multiple execution modes for different environments.
+- PRODUCTION: Full Temporal integration with remote server
+- LOCAL: Docker-based Temporal (docker-compose provided)
+- MOCK: Synchronous execution, no Temporal dependency (unit tests)
+- TEST: Temporal TestWorkflowEnvironment for CI/CD integration tests
+- Mode selection via configuration property
 
 ---
 
@@ -132,6 +163,10 @@
 
 **A-3:** Existing `PfContextHolder` and `TenantContextHolder` APIs are stable
 
+**A-4:** A `TenantProvider` interface will be implemented by consuming services to supply the list of active tenants
+- Interface contract: `List<String> getActiveTenantIds()`
+- Implementation responsibility of each microservice
+
 ---
 
 ## 5. Out of Scope (v1.0)
@@ -140,5 +175,6 @@
 - Complex workflow patterns (sagas, compensations)
 - Event-driven job triggering (signals)
 - Real-time job state queries
+- Cross-service workflow orchestration
 
 ---
