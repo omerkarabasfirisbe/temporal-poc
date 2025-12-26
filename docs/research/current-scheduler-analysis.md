@@ -1,8 +1,8 @@
-# Research: Current Scheduler Analysis & Temporal Migration Path
+# Research: Current Scheduler Analysis & Parent Library Design
 
-**Purpose:** This document analyzes the existing scheduler implementation and explores which Temporal features can replace or enhance the current approach.
+**Purpose:** This document analyzes the existing scheduler implementation and identifies which Temporal features should be wrapped in our custom Parent Library.
 
-**Context:** Based on the VPos Summary Scheduler implementation in `vposgw-srv` module.
+**Context:** Based on the VPos Summary Scheduler implementation and the "Parent Library" concept discussed in the Gorkem & Omer meeting.
 
 ---
 
@@ -29,281 +29,189 @@ The VPos Summary Scheduler is a daily job that calculates and stores transaction
 
 ---
 
-## Temporal Features for Migration
+## Parent Library Concept
 
-### 1. Schedules (Replaces @Scheduled + Cron)
+The goal is not to directly integrate Temporal into every microservice. Instead, we will create a **shared Parent Library** that:
 
-Temporal Schedules provide a more powerful alternative to Spring @Scheduled:
+1. Wraps Temporal SDK complexity
+2. Provides simple annotations/interfaces for service developers
+3. Handles tenant context, retry logic, and error handling automatically
+4. Allows microservice developers to focus only on business logic
 
-**Current Approach:**
+**Target Developer Experience:**
 ```java
-@Scheduled(cron = "${vpos-summary.scheduled.cron}")
-```
-
-**Temporal Approach:**
-```java
-// Creating a Schedule
-ScheduleClient scheduleClient = ScheduleClient.newInstance(WorkflowServiceStubs.newInstance());
-
-Schedule schedule = Schedule.newBuilder()
-    .setAction(ScheduleActionStartWorkflow.newBuilder()
-        .setWorkflowType(VPosSummaryWorkflow.class)
-        .setOptions(WorkflowOptions.newBuilder()
-            .setTaskQueue("vpos-summary-queue")
-            .build())
-        .build())
-    .setSpec(ScheduleSpec.newBuilder()
-        .setCronExpressions(List.of("0 0 2 * * *")) // Daily at 2 AM
-        .build())
-    .build();
-
-scheduleClient.createSchedule("vpos-summary-schedule", schedule, ScheduleOptions.newBuilder().build());
-```
-
-**Benefits:**
-- No external cron daemon needed
-- Schedule state is durable (survives restarts)
-- Can pause, resume, backfill, and trigger manually via UI or API
-- Full visibility into schedule execution history
-
----
-
-### 2. Built-in Distributed Locking (Replaces ShedLock)
-
-Temporal provides automatic distributed execution without external locking:
-
-**Current Approach:**
-```java
-@SchedulerLock(name = "scheduled_vpos_summary", lockAtMostFor = "60m", lockAtLeastFor = "60m")
-```
-
-**Temporal Approach:**
-- No explicit locking needed
-- Workflow ID uniqueness guarantees single execution
-- If a Workflow with the same ID is already running, new execution is rejected or queued
-
-```java
-WorkflowOptions options = WorkflowOptions.newBuilder()
-    .setWorkflowId("vpos-summary-" + LocalDate.now()) // Unique per day
-    .setTaskQueue("vpos-summary-queue")
-    .setWorkflowIdReusePolicy(WorkflowIdReusePolicy.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE)
-    .build();
-```
-
-**Benefits:**
-- No database table required for locks
-- No lock expiry issues
-- Automatic handling of pod crashes
-
----
-
-### 3. Child Workflows (Replaces runForeachTenantContext)
-
-For multi-tenant processing, Temporal Child Workflows provide isolation and parallelism:
-
-**Current Approach:**
-```java
-TenantContextHolder.runForeachTenantContext(context, () -> {
-    // Process single tenant
-});
-```
-
-**Temporal Approach:**
-```java
-// Parent Workflow
-@WorkflowInterface
-public interface VPosSummaryWorkflow {
-    @WorkflowMethod
-    void processSummary(LocalDate date);
-}
-
-public class VPosSummaryWorkflowImpl implements VPosSummaryWorkflow {
-    @Override
-    public void processSummary(LocalDate date) {
-        List<String> tenantIds = activities.getAllTenantIds();
-        
-        List<Promise<Void>> childPromises = new ArrayList<>();
-        for (String tenantId : tenantIds) {
-            // Start child workflow for each tenant (parallel execution)
-            TenantSummaryWorkflow child = Workflow.newChildWorkflowStub(
-                TenantSummaryWorkflow.class,
-                ChildWorkflowOptions.newBuilder()
-                    .setWorkflowId("summary-" + date + "-" + tenantId)
-                    .build()
-            );
-            childPromises.add(Workflow.async(child::processTenant, tenantId, date));
-        }
-        
-        // Wait for all tenants to complete
-        Promise.allOf(childPromises).get();
-    }
-}
-
-// Child Workflow (per tenant)
-@WorkflowInterface
-public interface TenantSummaryWorkflow {
-    @WorkflowMethod
-    void processTenant(String tenantId, LocalDate date);
+// Developer only writes this - no Temporal knowledge required
+@ScheduledJob(cron = "0 0 2 * * *", name = "vpos-summary")
+public void processSummary(TenantContext tenant, LocalDate date) {
+    List<SummaryEntity> data = dataService.getTransactionSummary(date);
+    summaryService.saveAll(data);
 }
 ```
 
-**Benefits:**
-- Each tenant has its own workflow with independent retry policy
-- Tenant A failure does not affect Tenant B
-- Parallel processing possible
-- Full visibility per tenant in Temporal UI
+The Parent Library handles everything else: scheduling, locking, tenant iteration, retries, and visibility.
 
 ---
 
-### 4. Activities with Retry (Replaces Manual Error Handling)
+## Temporal Features to Wrap in Parent Library
 
-**Current Approach:**
-- No explicit retry logic
-- If database call fails, entire job fails
+This section identifies which Temporal features we should leverage internally, hidden from microservice developers.
 
-**Temporal Approach:**
-```java
-@ActivityInterface
-public interface SummaryActivities {
-    
-    @ActivityMethod
-    List<SummaryEntity> getTransactionSummary(String tenantId, OffsetDateTime begin, OffsetDateTime end);
-    
-    @ActivityMethod
-    void saveSummaryData(String tenantId, List<SummaryEntity> data);
-}
+### 1. Schedules API
 
-// Activity options with retry
-ActivityOptions options = ActivityOptions.newBuilder()
-    .setStartToCloseTimeout(Duration.ofMinutes(5))
-    .setRetryOptions(RetryOptions.newBuilder()
-        .setInitialInterval(Duration.ofSeconds(1))
-        .setMaximumInterval(Duration.ofMinutes(1))
-        .setBackoffCoefficient(2.0)
-        .setMaximumAttempts(5)
-        .build())
-    .build();
-```
+**What Temporal Provides:**
+- Durable cron-like scheduling
+- Pause, resume, backfill capabilities
+- Schedule execution history
 
-**Benefits:**
-- Automatic retry with exponential backoff
-- Configurable per activity
-- No try-catch clutter in business logic
+**What Parent Library Should Expose:**
+- Simple `@ScheduledJob(cron = "...")` annotation
+- Internal translation to Temporal Schedule
+- Automatic schedule registration on application startup
+
+**Internal Responsibility:**
+- Create and manage Temporal Schedules
+- Handle schedule updates when cron changes
+- Provide admin API for pause/resume if needed
 
 ---
 
-### 5. Task Queues (Multi-Tenant Isolation)
+### 2. Workflow ID Uniqueness (Distributed Locking)
 
-**Current Approach:**
-- All tenants share same execution context
-- No resource isolation
+**What Temporal Provides:**
+- Single execution guarantee via Workflow ID
+- Configurable reuse policies
+- No external lock table needed
 
-**Temporal Approach:**
-```java
-// Option A: Separate queue per tenant
-String taskQueue = "summary-queue-" + tenantId;
+**What Parent Library Should Expose:**
+- Nothing explicit - locking should be automatic
+- Job name becomes Workflow ID prefix
 
-// Option B: Single queue with workflow-level isolation
-WorkflowOptions.newBuilder()
-    .setTaskQueue("summary-queue")
-    .setWorkflowId("summary-" + tenantId + "-" + date)
-    .build();
-```
-
-**Benefits:**
-- Tenant A heavy load does not block Tenant B
-- Can scale workers per tenant if needed
-- Clear visibility and metrics per queue
+**Internal Responsibility:**
+- Generate unique Workflow IDs per job + date/tenant
+- Configure `WorkflowIdReusePolicy` appropriately
+- Handle "already running" scenarios gracefully
 
 ---
 
-### 6. Signals (Event-Driven Triggering)
+### 3. Tenant Context Propagation
 
-**Use Case:** Trigger summary calculation on-demand, not just on schedule
+**What Temporal Provides:**
+- Workflow input parameters
+- Activity context passing
 
-**Temporal Approach:**
-```java
-@WorkflowInterface
-public interface VPosSummaryWorkflow {
-    @WorkflowMethod
-    void run();
-    
-    @SignalMethod
-    void triggerManualRun(LocalDate date);
-}
-```
+**What Parent Library Should Expose:**
+- `TenantContext` as method parameter (injected automatically)
+- Integration with existing `PfContextHolder` and `TenantContextHolder`
 
-**Benefits:**
-- Can trigger workflow from external event
-- Supports hybrid approach: scheduled + event-driven
+**Internal Responsibility:**
+- Fetch all tenant IDs at job start
+- Create child workflow or activity per tenant
+- Set `PfContextHolder` before calling business logic
+- Clear context after execution
 
 ---
 
-## Mapping: Current vs Temporal
+### 4. Child Workflows for Tenant Isolation
 
-**Spring @Scheduled + Cron**
-- Temporal Equivalent: Schedules API
-- Benefit: Durable, observable, controllable
+**What Temporal Provides:**
+- Independent execution per child
+- Parallel or sequential execution options
+- Per-child retry and visibility
 
-**ShedLock (@SchedulerLock)**
-- Temporal Equivalent: Workflow ID uniqueness
-- Benefit: No external dependency, no lock table
+**What Parent Library Should Expose:**
+- Configuration option: `parallel = true/false`
+- Per-tenant failure does not affect others (automatic)
 
-**TenantContextHolder.runForeachTenantContext**
-- Temporal Equivalent: Child Workflows
-- Benefit: Parallel execution, per-tenant visibility
+**Internal Responsibility:**
+- Create parent workflow that orchestrates
+- Spawn child workflow per tenant
+- Aggregate results and report failures
 
-**Manual try-catch for retries**
-- Temporal Equivalent: Activity RetryOptions
-- Benefit: Declarative, automatic
+---
 
-**Log-based debugging**
-- Temporal Equivalent: Temporal UI + Query API
-- Benefit: Real-time visibility, full history
+### 5. Activity Retry Options
+
+**What Temporal Provides:**
+- Configurable retry policies (attempts, backoff, intervals)
+- Automatic retry execution
+- Non-retryable exception handling
+
+**What Parent Library Should Expose:**
+- Annotation-based retry config: `@Retryable(maxAttempts = 5)`
+- Or global defaults via configuration
+
+**Internal Responsibility:**
+- Translate annotations to `RetryOptions`
+- Apply sensible defaults
+- Handle exception classification (retryable vs non-retryable)
+
+---
+
+### 6. Visibility and Monitoring
+
+**What Temporal Provides:**
+- Temporal UI for workflow inspection
+- Query API for programmatic access
+- Full execution history
+
+**What Parent Library Should Expose:**
+- Optional: REST endpoint for job status
+- Logging integration with existing infrastructure
+
+**Internal Responsibility:**
+- Configure Temporal client for metrics export
+- Optionally expose simplified status API
+
+---
+
+## Features NOT to Expose Initially
+
+Some Temporal features are powerful but add complexity. For the first version of Parent Library, we should NOT expose:
+
+- **Signals:** Event-driven triggering adds complexity
+- **Queries:** Real-time workflow state inspection
+- **Continue-As-New:** Long-running workflow patterns
+- **Saga/Compensation:** Complex rollback scenarios
+
+These can be added in future versions as needed.
+
+---
+
+## Parent Library Components
+
+Based on the above analysis, the Parent Library should contain:
+
+**1. Annotation Processor**
+- `@ScheduledJob` - defines a scheduled job
+- `@Retryable` - configures retry behavior (optional)
+
+**2. Temporal Client Wrapper**
+- Abstracts Temporal SDK setup
+- Manages connection lifecycle
+
+**3. Schedule Manager**
+- Registers jobs as Temporal Schedules on startup
+- Handles schedule CRUD operations
+
+**4. Tenant Orchestrator**
+- Fetches tenant list
+- Creates child workflows per tenant
+- Manages context propagation
+
+**5. Activity Executor**
+- Wraps business logic as Temporal Activity
+- Applies retry policies
+- Handles context setup/teardown
 
 ---
 
 ## Research Backlog
 
-- [ ] How to pass tenant context (PfContextHolder) into Temporal Workflow/Activity
-- [ ] Integration with existing PfContextBuilder
-- [ ] Performance comparison: Sequential vs Parallel tenant processing
-- [ ] Temporal Server deployment options (self-hosted vs cloud)
-- [ ] Migration strategy: Gradual rollout vs Big Bang
-
----
-
-## Proposed Architecture
-
-```
-                     Temporal Schedule
-                           |
-                           v
-                 +-------------------+
-                 | VPosSummaryWorkflow|
-                 | (Parent)           |
-                 +-------------------+
-                           |
-         +-----------------+-----------------+
-         |                 |                 |
-         v                 v                 v
-+---------------+  +---------------+  +---------------+
-| TenantWorkflow|  | TenantWorkflow|  | TenantWorkflow|
-| (tenant-a)    |  | (tenant-b)    |  | (tenant-c)    |
-+---------------+  +---------------+  +---------------+
-         |                 |                 |
-         v                 v                 v
-   +----------+      +----------+      +----------+
-   | Activity |      | Activity |      | Activity |
-   | DB Query |      | DB Query |      | DB Query |
-   +----------+      +----------+      +----------+
-         |                 |                 |
-         v                 v                 v
-   +----------+      +----------+      +----------+
-   | Activity |      | Activity |      | Activity |
-   | DB Save  |      | DB Save  |      | DB Save  |
-   +----------+      +----------+      +----------+
-```
+- [ ] How to integrate with existing `PfContextHolder` and `PfContextBuilder`
+- [ ] Annotation processing approach: compile-time vs runtime
+- [ ] Temporal client configuration (connection pooling, timeouts)
+- [ ] Error reporting integration with existing alerting system
+- [ ] Gradual migration strategy for existing scheduled jobs
 
 ---
 
